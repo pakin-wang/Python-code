@@ -1,0 +1,79 @@
+########################
+# transfer tif format predictors to txt format
+########################
+
+import os
+import numpy as np
+import rasterio
+import time
+
+start_time = time.time()
+
+tif_folder = r'...\Predictors\GeoTIFF\2022'
+output_folder = r'...\Predictors\TXT\2022'
+lc_file = r'G:\suitability\LC_2022.tif'
+
+if not os.path.exists(output_folder):
+    os.makedirs(output_folder)
+
+tif_files = [f for f in os.listdir(tif_folder) if f.endswith('.tif')]
+
+rows, cols = None, None
+predictors = []
+
+tif_data = {}
+for tif in tif_files:
+    tif_path = os.path.join(tif_folder, tif)
+    with rasterio.open(tif_path) as src:
+        data = src.read(1)
+        print(f'{tif} loaded')
+        invalid_value = data[0, 0]
+        data = np.where(data == invalid_value, np.nan, data)
+
+    tif_data[tif] = data
+    predictors.append(tif.replace('.tif', ''))
+
+    if rows is None:
+        rows, cols = data.shape
+    elif data.shape != (rows, cols):
+        raise ValueError(f"All tif files must have the same shape, but {tif} does not match.")
+
+with rasterio.open(lc_file) as lc_src:
+    lc_data = lc_src.read(1)
+
+block_size = 100
+num_blocks = cols // block_size
+
+for block_num in range(num_blocks):
+    start_col = block_num * block_size
+    end_col = start_col + block_size
+
+    output_file = os.path.join(output_folder, f'predictors_{start_col}_{end_col}.txt')
+
+    with open(output_file, 'w') as f:
+        header = ['row', 'col'] + predictors
+        f.write(' '.join(header) + '\n')
+
+        for i in range(rows):
+            for j in range(start_col, end_col):
+                lc_value = lc_data[i, j]
+                if lc_value in [0, 210, 220]:
+                    continue
+                row_col = [i, j]
+
+                feature_values = []
+                nan_count = 0
+                for tif in tif_files:
+                    value = tif_data[tif][i, j]
+                    feature_values.append(value)
+                    if np.isnan(value):
+                        nan_count += 1
+
+                if nan_count > 20:
+                    continue
+
+                line = [str(i), str(j)] + [str(val) for val in feature_values]
+                f.write(' '.join(line) + '\n')
+
+end_time = time.time()
+print('Processing time:', end_time - start_time, 'seconds')
