@@ -1,0 +1,51 @@
+########################
+# 1km--txt To TIFF
+########################
+
+import numpy as np
+import pandas as pd
+import os
+import joblib
+import rasterio
+
+# load predictors
+selected_features_file = r"...\selected_features_RFECV.txt"
+selected_features = pd.read_csv(selected_features_file, header=None, sep='\s+')
+
+# load rf model
+model_file = r"...\RFmodel.pkl"
+rf_model = joblib.load(model_file)
+
+rows = 21600
+cols = 43200
+suitability_array = np.full((rows, cols), np.nan)
+
+txt_folder = r"...\Predictors\TXT\2022"
+
+for txt_file in os.listdir(txt_folder):
+    if txt_file.endswith(".txt"):
+        txt_file_path = os.path.join(txt_folder, txt_file)
+
+        data = pd.read_csv(txt_file_path, header=0, sep='\s+', low_memory=False)
+        rows_col = data.iloc[:, 0:2].values
+        features = data.iloc[:, 2:].values
+
+        feature_names = data.columns[2:].values
+        selected_feature_names = selected_features.iloc[:, 0].values
+        selected_feature_indices = np.isin(feature_names, selected_feature_names)
+
+        filtered_features = features[:, selected_feature_indices]
+        prediction_proba = rf_model.predict_proba(filtered_features)[:, 1]
+
+        rows_col = rows_col.astype(int)
+        suitability_array[rows_col[:, 0], rows_col[:, 1]] = prediction_proba
+    print(f'{txt_file} completed')
+
+reference_tif_path = r"...\Predictors\GeoTIFF\2022\Met1.tif"
+with rasterio.open(reference_tif_path) as src:
+    transform = src.transform
+    crs = src.crs
+
+output_file = r"...\SuitabilityResults\2022\Barley.tif"
+with rasterio.open(output_file, 'w', driver='GTiff', height=rows, width=cols, count=1, dtype='float32', crs=crs, transform=transform) as dst:
+    dst.write(suitability_array, 1)
