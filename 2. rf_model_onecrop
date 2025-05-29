@@ -1,0 +1,189 @@
+########################
+# RF model
+########################
+
+import pandas as pd
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.feature_selection import RFECV
+from skopt import BayesSearchCV
+from skopt.space import Real, Categorical, Integer
+import glob
+import os
+import time
+import joblib
+import random
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, message=".*evaluated at point.*")
+
+######################################################################## 1. Load crop sample data
+samples_path = r"...\allsamples.csv"
+samples = pd.read_csv(samples_path)
+samples.columns = ["species", "Longitude", "Latitude"]
+lat_res = 180 / 21600
+lon_res = 360 / 43200
+samples = samples.dropna(subset=["Latitude", "Longitude"])
+samples = samples[(samples["Latitude"].between(-90, 90)) & (samples["Longitude"].between(-180, 180))]
+samples["Row"] = ((90 - samples["Latitude"]) / lat_res).astype(int)
+samples["Col"] = ((samples["Longitude"] + 180) / lon_res).astype(int)
+
+######################################################################## 2. Load predictors
+env_factors_path = r'...\*.tif'
+tif_files = glob.glob(env_factors_path)
+
+env_data = {}
+with rasterio.open(tif_files[0]) as src:
+    rows, cols = src.shape
+    transform = src.transform
+    crs = src.crs
+
+for tif in tif_files:
+    factor_name = os.path.basename(tif).replace('.tif', '')
+    with rasterio.open(tif) as src:
+        data = src.read(1)
+        invalid_value = data[0, 0]
+        data = np.where(data == invalid_value, np.nan, data)
+        env_data[factor_name] = data
+factor_names = list(env_data.keys())
+######################################################################## 3. Match sample points and predictors
+for factor_name, factor_data in env_data.items():
+    samples[factor_name] = factor_data[samples["Row"], samples["Col"]]
+
+valid_samples = samples.dropna(subset=list(env_data.keys()))
+X = np.vstack(valid_samples[list(env_data.keys())].values)
+y = np.ones(len(valid_samples))
+
+######################################################################## 4. Generate absence samples
+samples_absence_path = r"...\all_samples.csv"
+samples_absence = pd.read_csv(samples_absence_path)
+num_pseudo_absences = len(valid_samples)
+
+non_this_samples = samples_absence[samples_absence["species"] != "Barley"]
+
+pseudo_absences = non_this_samples.sample(n=num_pseudo_absences, random_state=42)
+pseudo_absences_data = pseudo_absences[["species", "longitude", "latitude"]]
+
+pseudo_absences_data.to_csv(r"...\absence_samples\1Barley.csv", index=False)
+print(f"Pseudo absence points saved")
+
+pseudo_absences_data = pseudo_absences_data.dropna(subset=["latitude", "longitude"])
+pseudo_absences_data = pseudo_absences_data[(pseudo_absences_data["latitude"].between(-90, 90)) & (pseudo_absences_data["longitude"].between(-180, 180))]
+pseudo_absences_data["Row"] = ((90 - pseudo_absences_data["latitude"]) / lat_res).astype(int)
+pseudo_absences_data["Col"] = ((pseudo_absences_data["longitude"] + 180) / lon_res).astype(int)
+for factor_name, factor_data in env_data.items():
+    pseudo_absences_data[factor_name] = factor_data[pseudo_absences_data["Row"], pseudo_absences_data["Col"]]
+
+absense_samples = pseudo_absences_data.dropna(subset=list(env_data.keys()))
+X_absense = np.vstack(absense_samples[list(env_data.keys())].values)
+y_absense = np.zeros(len(absense_samples))
+
+X_full = np.vstack((X, X_absense))
+y_full = np.hstack((y, y_absense))
+
+######################################################################## 5. Traning and test set
+X_train, X_test, y_train, y_test = train_test_split(X_full, y_full, test_size=0.25, random_state=42)
+########## RFECV
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+selector = RFECV(estimator=RandomForestClassifier(random_state=42, n_jobs=5),
+                 step=1,
+                 cv=cv,
+                 scoring='accuracy',
+                 n_jobs=5)
+selector.fit(X_train, y_train)
+
+selected_feature_names = [factor_names[i] for i in range(len(factor_names)) if selector.support_[i]]
+
+selected_features_path = r'...\selected_features_RFECV.txt'
+with open(selected_features_path, 'w') as f:
+    f.write('\n'.join(selected_feature_names))
+
+print(f"selected features: {selected_features_path}")
+print(f"number of selected features: {len(selected_feature_names)}")
+
+selected_X_train = X_train[:, selector.support_]
+selected_X_test = X_test[:, selector.support_]
+
+######################################################################## 6. RF model
+########## Bayesian
+param_space = {
+    'max_features': Categorical(['sqrt', 'log2', .5, None, 1.0]),
+    'n_estimators': Categorical([100, 200, 300, 400, 500, 600, 700, 800, 900])
+}
+
+start_time = time.time()
+print('Bayesian Optimization started...')
+
+rf_classifier = RandomForestClassifier(max_depth=None, max_samples=None, min_samples_leaf=1, random_state=42)
+opt = BayesSearchCV(
+    rf_classifier, param_space,
+    n_iter=20,
+    cv=5,
+    verbose=1,
+    n_jobs=5,
+    return_train_score=True
+)
+y_train_ravel = np.ravel(y_train)
+opt.fit(selected_X_train, y_train_ravel)
+end_time = time.time()
+print('Bayesian Optimization Time: {:.2f} seconds'.format(end_time - start_time))
+print('Best Score: %f' % opt.best_score_)
+print('Best Parameters:')
+for key, value in opt.best_params_.items():
+    print(f'{key}: {value}')
+
+##########
+model = RandomForestClassifier(n_estimators=700, max_features='sqrt', max_depth=None, max_samples=None, min_samples_leaf=1, random_state=42)
+model.fit(selected_X_train, y_train)
+
+y_pred = model.predict(selected_X_test)
+print("Accuracy with selected features:", accuracy_score(y_test, y_pred))
+print("Classification Report with selected features:")
+print(classification_report(y_test, y_pred))
+
+output_path = r"...\feature_importance.txt"
+with open(output_path, "w") as f:
+    for feature, importance in zip(selected_feature_names, model.feature_importances_):
+        f.write(f"{feature}\t{importance}\n")
+print(f"feature importance: {output_path}")
+
+model_path = r'...\RFmodel.pkl'
+joblib.dump(model, model_path)
+print(f"RF model path: {model_path}")
+
+conf_matrix = confusion_matrix(y_test, y_pred)
+print("Confusion Matrix:\n", conf_matrix)
+
+PA_0 = conf_matrix[0, 0] / conf_matrix[0, :].sum()
+PA_1 = conf_matrix[1, 1] / conf_matrix[1, :].sum()
+
+UA_0 = conf_matrix[0, 0] / conf_matrix[:, 0].sum()
+UA_1 = conf_matrix[1, 1] / conf_matrix[:, 1].sum()
+
+OA = (conf_matrix[0, 0] + conf_matrix[1, 1]) / conf_matrix.sum()
+
+print(f"Producer's Accuracy for class 0: {PA_0:.3f}")
+print(f"Producer's Accuracy for class 1: {PA_1:.3f}")
+print(f"User's Accuracy for class 0: {UA_0:.3f}")
+print(f"User's Accuracy for class 1: {UA_1:.3f}")
+print(f"Overall Accuracy: {OA:.3f}")
+accuracy_output_path = r"...\accuracy_results.txt"
+
+with open(accuracy_output_path, "w") as f:
+    f.write(f"Accuracy  with selected features: {accuracy_score(y_test, y_pred)}\n")
+    f.write("Classification  Report with selected features:\n")
+    f.write(classification_report(y_test, y_pred))
+    f.write("\nConfusion  Matrix:\n")
+    f.write(str(conf_matrix))
+    f.write("\n")
+    f.write(f"Producer's  Accuracy for class 0: {PA_0:.3f}\n")
+    f.write(f"Producer's  Accuracy for class 1: {PA_1:.3f}\n")
+    f.write(f"User's  Accuracy for class 0: {UA_0:.3f}\n")
+    f.write(f"User's  Accuracy for class 1: {UA_1:.3f}\n")
+    f.write(f"Overall  Accuracy: {OA:.3f}\n")
+
+print(f"Accuracy results: {accuracy_output_path}")
